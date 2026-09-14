@@ -6,32 +6,59 @@
     .DESCRIPTION
     The gate xgit runs (Test-XmipSelfVerifyingModule). Needs the `java` and
     `c` prerequisites: the JDK for javac, jni.h and the JVM; zig cc for the
-    shim. The shim loads the JVM at run time, so nothing links against the JDK.
+    shim. The shim loads the JVM at run time, so nothing links against the
+    JDK. The probe and the shim's build are the capability's, shared by every
+    language technology (ADR-0044): probe/verify.ps1 beside this repository's
+    mount in the estate, or where XMIP_CONTRACT_PROBE points.
 #>
 [CmdletBinding()]
 param()
 
+Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
 function Find-JavaHome {
-    if ($env:JAVA_HOME -and (Test-Path -LiteralPath $env:JAVA_HOME)) { return $env:JAVA_HOME }
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    if ($env:JAVA_HOME -and (Test-Path -LiteralPath $env:JAVA_HOME)) {
+        return $env:JAVA_HOME
+    }
     $javac = Get-Command javac -ErrorAction SilentlyContinue
-    if ($javac) { return (Split-Path (Split-Path $javac.Source)) }
-    foreach ($root in @('C:\Program Files\Microsoft', 'C:\Program Files\Eclipse Adoptium', '/usr/lib/jvm', '/opt/homebrew/opt')) {
-        $found = Get-ChildItem -Path $root -Directory -Filter 'jdk*' -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
-        if ($found) { return $found.FullName }
+    if ($javac) {
+        return (Split-Path (Split-Path $javac.Source))
+    }
+    [string[]] $roots = @(
+        'C:\Program Files\Microsoft',
+        'C:\Program Files\Eclipse Adoptium',
+        '/usr/lib/jvm',
+        '/opt/homebrew/opt'
+    )
+    foreach ($root in $roots) {
+        $found = Get-ChildItem -Path $root -Directory -Filter 'jdk*' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+        if ($found) {
+            return $found.FullName
+        }
     }
     return $null
 }
 
 [string] $javaHome = Find-JavaHome
-if (-not $javaHome) { Write-Host 'FAILED. No JDK; prerequisite.toml declares java.'; exit 2 }
-if (-not (Get-Command zig -ErrorAction SilentlyContinue)) { Write-Host 'FAILED. zig is not installed (prerequisite c).'; exit 2 }
-[string] $include = $env:XMIP_ABI_INCLUDE
-if (-not $include) { $include = Join-Path $PSScriptRoot '..' '..' '..' 'foundation' 'abi' 'include' }
-if (-not (Test-Path -LiteralPath (Join-Path $include 'xmip_module.h'))) {
-    Write-Host "FAILED. xmip_module.h not found under $include; set XMIP_ABI_INCLUDE."
+if ([string]::IsNullOrWhiteSpace($javaHome)) {
+    Write-Host 'FAILED. No JDK; prerequisite.toml declares java.'
+    exit 2
+}
+[string] $probe = $env:XMIP_CONTRACT_PROBE
+if ([string]::IsNullOrWhiteSpace($probe)) {
+    $probe = Join-Path $PSScriptRoot '..' 'probe'
+}
+[string] $verify = Join-Path $probe 'verify.ps1'
+if (-not (Test-Path -LiteralPath $verify)) {
+    Write-Host "FAILED. The capability's probe is not at $probe; set XMIP_CONTRACT_PROBE."
     exit 2
 }
 
@@ -39,38 +66,48 @@ if (-not (Test-Path -LiteralPath (Join-Path $include 'xmip_module.h'))) {
 [string] $javac = Join-Path $bin 'javac'
 [string] $java = Join-Path $bin 'java'
 [string] $jar = Join-Path $bin 'jar'
-[string] $jniPlatform = if ($IsWindows) { 'win32' } elseif ($IsMacOS) { 'darwin' } else { 'linux' }
+[string] $jniPlatform = 'linux'
+if ($IsWindows) {
+    $jniPlatform = 'win32'
+}
+elseif ($IsMacOS) {
+    $jniPlatform = 'darwin'
+}
 [string] $jniInclude = Join-Path $javaHome 'include'
 New-Item -ItemType Directory -Force -Path build/classes | Out-Null
 
 Write-Host "   javac -> build/classes  (JDK at $javaHome)"
-& $javac -d build/classes (Get-ChildItem java -Recurse -Filter '*.java').FullName tests/ContractTest.java
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+[string[]] $sources = (Get-ChildItem java -Recurse -Filter '*.java').FullName
+& $javac -d build/classes $sources tests/ContractTest.java
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 Write-Host '   java ContractTest'
 & $java -cp build/classes ContractTest
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 Write-Host '   jar -> build/xmip-core-contract-java.jar'
 & $jar --create --file build/xmip-core-contract-java.jar -C build/classes xmip
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
-[string] $library = if ($IsWindows) { 'xmip_core_contract_java.dll' }
-    elseif ($IsMacOS) { 'libxmip_core_contract_java.dylib' } else { 'libxmip_core_contract_java.so' }
-[string] $probe = if ($IsWindows) { 'probe.exe' } else { 'probe' }
-
-Write-Host "   zig cc -shared -> build/$library"
-& zig cc -shared -O2 -fvisibility=hidden -Wall -Wextra -Werror -I $include -I $jniInclude -I (Join-Path $jniInclude $jniPlatform) `
-    shim/xmip_java_shim.c -o (Join-Path build $library)
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-Write-Host "   zig cc -> build/$probe"
-& zig cc -O1 -Wall -Wextra -Werror -I $include -I $jniInclude -I (Join-Path $jniInclude $jniPlatform) `
-    shim/xmip_java_shim.c tests/probe.c -o (Join-Path build $probe)
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
+# The probe loads the JVM at run time through the shim, from these.
 $env:JAVA_HOME = $javaHome
 $env:XMIP_JAVA_CLASSPATH = (Resolve-Path build/xmip-core-contract-java.jar).Path
-if ($IsWindows) { $env:Path = "$(Join-Path $javaHome 'bin' 'server');$(Join-Path $javaHome 'bin');$env:Path" }
-& (Join-Path $PSScriptRoot 'build' $probe)
+if ($IsWindows) {
+    $env:Path = "$(Join-Path $javaHome 'bin' 'server');$(Join-Path $javaHome 'bin');$env:Path"
+}
+
+[hashtable] $build = @{
+    Directory = $PSScriptRoot
+    Compiler  = 'cc'
+    Source    = @('shim/xmip_java_shim.c')
+    Standard  = 'java'
+    Include   = @($jniInclude, (Join-Path $jniInclude $jniPlatform))
+}
+& $verify @build
 exit $LASTEXITCODE
